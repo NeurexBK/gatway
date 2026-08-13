@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+src/database/*.db*
+prisma/*.db*
+.DS_Store
+npm-debug.log*

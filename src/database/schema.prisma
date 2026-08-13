@@ -1,0 +1,206 @@
+// Gateway descentralizado de pagamentos — schema Prisma
+//
+// Modelo de negócio: BROKER.
+//   cliente paga fiat -> on-ramp credita USDC no vault -> swap para SOL
+//   -> cliente recebe SOL menos a taxa (imediato)
+//   -> a taxa fica retida no vault como LUCRO
+//   -> o lucro acumulado é distribuído aos sócios em horário fixo diário.
+//
+// Dev: SQLite. Para produção troque o provider para "postgresql" (BigInt/
+// Decimal/String são portáveis) e rode migrations.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Uma ordem = um pagamento fiat.
+/// PENDING -> PROCESSING -> SWAPPED -> SETTLED -> DISTRIBUTED (ou FAILED).
+///   SWAPPED     = o SOL desta ordem está no vault
+///   SETTLED     = o cliente já recebeu a parte dele; o lucro está acumulado
+///   DISTRIBUTED = o lucro desta ordem entrou num PayoutRun concluído
+/// Ver `OrderStatus` em src/types/index.ts (SQLite não tem enum nativo).
+model Order {
+  id String @id @default(cuid())
+
+  // ── Identidade no provedor fiat (chave de idempotência do webhook) ──
+  provider          String
+  providerEventId   String  @unique
+  providerPaymentId String?
+  customerRef       String?
+
+  // ── Lado fiat ──
+  fiatCurrency String
+  fiatAmount   Decimal
+
+  // ── Lado on-chain: entrada (stablecoin creditada pelo on-ramp) ──
+  inputMint        String
+  inputAmountRaw   BigInt
+  depositSignature String?
+
+  // ── Destino do cliente (modelo broker) ──
+  customerWallet          String
+  customerLamports        BigInt?
+  customerPayoutSignature String?
+
+  // ── Taxa aplicada nesta operação (snapshot: auditável para sempre) ──
+  /// Custo real do on-ramp em bps, medido em tempo real no momento da cotação.
+  providerCostBps Int?
+  /// Nossa margem em bps, vinda das configurações do admin.
+  marginBps       Int?
+  /// Taxa efetiva cobrada = providerCostBps + marginBps.
+  feeBps          Int?
+  /// Provedor escolhido como mais barato no momento da operação.
+  feeSourceProvider String?
+
+  // ── Swap (Jupiter v6) ──
+  swapSignature       String?
+  solReceivedLamports BigInt?
+  quotedOutLamports   BigInt?
+  priceImpactPct      String?
+
+  // ── Lucro retido desta ordem ──
+  profitLamports BigInt?
+  payoutRunId    String?
+  payoutRun      PayoutRun? @relation(fields: [payoutRunId], references: [id])
+
+  // ── Máquina de estados ──
+  status    String   @default("PENDING")
+  attempts  Int      @default(0)
+  lastError String?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  swappedAt     DateTime?
+  settledAt     DateTime?
+  distributedAt DateTime?
+
+  @@index([status, createdAt])
+  @@index([provider, providerPaymentId])
+  @@index([payoutRunId])
+}
+
+/// Uma execução da distribuição de lucro (agendada ou manual).
+/// Agrupa as ordens cujo lucro foi pago e as transferências efetuadas.
+model PayoutRun {
+  id String @id @default(cuid())
+
+  /// Instante para o qual a execução foi agendada (o horário fixo diário).
+  scheduledFor DateTime
+  /// MANUAL quando disparada pelo admin, SCHEDULED quando pelo timer.
+  trigger      String   @default("SCHEDULED")
+
+  /// Lucro total elegível no momento da execução.
+  totalLamports BigInt @default(0)
+  /// Quantas ordens entraram nesta execução.
+  orderCount    Int    @default(0)
+
+  status    String  @default("RUNNING") // RUNNING | COMPLETED | PARTIAL | FAILED | SKIPPED
+  skipReason String?
+  lastError String?
+
+  orders  Order[]
+  payouts Payout[]
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  @@index([status, scheduledFor])
+}
+
+/// Uma linha por destinatário por execução — base de reconciliação.
+/// Os bps ficam gravados aqui: mudar a config no admin depois não reescreve
+/// o histórico.
+model Payout {
+  id    String    @id @default(cuid())
+  runId String
+  run   PayoutRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  label    String
+  address  String
+  bps      Int
+  lamports BigInt
+
+  batchIndex Int     @default(0)
+  signature  String?
+  status     String  @default("PENDING") // PENDING | SENT | FAILED
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([runId, address])
+  @@index([address])
+}
+
+/// Destinatários do split, gerenciados pelo admin (substitui RECIPIENTS_JSON,
+/// que agora serve apenas como seed na primeira subida).
+/// A soma dos bps dos ativos precisa ser exatamente 10000.
+model Recipient {
+  id      String  @id @default(cuid())
+  label   String
+  address String  @unique
+  bps     Int
+  active  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active])
+}
+
+/// Configuração global editável no admin. Linha única (id = "default").
+model GatewaySettings {
+  id String @id @default("default")
+
+  // ── Distribuição de lucro ──
+  /// Habilita/desabilita a distribuição automática.
+  distributionEnabled Boolean @default(true)
+  /// Hora local (0-23) do disparo diário.
+  distributionHour    Int     @default(0)
+  /// Minuto local (0-59) do disparo diário.
+  distributionMinute  Int     @default(0)
+  /// Timezone IANA de referência (ex.: "Europe/Lisbon", "America/Sao_Paulo").
+  distributionTimezone String @default("UTC")
+  /// Lucro mínimo acumulado para a execução valer a fee de rede.
+  minProfitLamports   BigInt  @default(5000000)
+
+  // ── Taxa ──
+  /// Nossa margem sobre o custo do provedor, em bps.
+  marginBps           Int     @default(150)
+  /// Piso e teto de sanidade para a taxa efetiva cobrada ao cliente.
+  minFeeBps           Int     @default(50)
+  maxFeeBps           Int     @default(1000)
+  /// Custo assumido quando nenhum provedor responde (fail-safe conservador).
+  fallbackProviderCostBps Int @default(200)
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Cache das taxas coletadas dos on-ramps — histórico de quem estava mais
+/// barato e quando. Serve para auditar a escolha "sempre o melhor".
+model ProviderFeeSnapshot {
+  id String @id @default(cuid())
+
+  provider     String
+  fiatCurrency String
+  /// Valor fiat consultado (a taxa costuma variar por faixa).
+  fiatAmount   Decimal
+  /// Custo total do provedor em bps sobre o valor fiat.
+  costBps      Int
+  /// Custo bruto reportado, para auditoria.
+  rawFeeAmount String?
+  available    Boolean  @default(true)
+  error        String?
+  /// true no provedor eleito mais barato nesta coleta.
+  selected     Boolean  @default(false)
+
+  collectedAt DateTime @default(now())
+
+  @@index([fiatCurrency, collectedAt])
+  @@index([provider, collectedAt])
+}
