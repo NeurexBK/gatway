@@ -29,7 +29,8 @@ const log = logger.child({ scope: 'payout' });
 let running = false;
 
 export interface RunOptions {
-  trigger?: 'SCHEDULED' | 'MANUAL';
+  /** SCHEDULED = timer in-process · CRON = cron externo · MANUAL = admin. */
+  trigger?: 'SCHEDULED' | 'CRON' | 'MANUAL';
   scheduledFor?: Date;
   /** Ignora o mínimo de lucro configurado (usado no disparo manual). */
   ignoreMinimum?: boolean;

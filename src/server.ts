@@ -1,117 +1,28 @@
-import type { Server } from 'node:http';
-import { createApp } from './app';
-import { config, LAMPORTS_PER_SOL } from './config';
-import { disconnectDatabase, prisma } from './database/client';
-import { previewSplit } from './services/distribution.service';
-import { retryPendingOrders } from './services/order.service';
-import { resumeIncompleteRuns } from './services/payout.service';
-import { startScheduler, stopScheduler } from './services/scheduler.service';
-import { ensureSeeded, getSettingsView } from './services/settings.service';
-import { assertSolanaReachable, lamportsToSol } from './services/solana.service';
-import { logger } from './utils/logger';
-
 /**
- * Bootstrap: valida dependências, semeia a configuração, sobe o HTTP, retoma
- * trabalho inacabado, inicia o agendador e instala shutdown gracioso.
+ * Entrypoint do servidor de longa duração.
+ *
+ * Deliberadamente minúsculo e sem imports estáticos do app: a validação de
+ * ambiente lança `ConfigError` durante o `import` de `./config`, e só um
+ * `import()` dinâmico dentro de `try/catch` consegue transformar isso numa
+ * mensagem útil em vez de um stack trace cru.
+ *
+ * Para o entrypoint serverless, ver `api/index.ts`.
  */
-
-let server: Server | undefined;
-let shuttingDown = false;
-
-async function main(): Promise<void> {
-  // Falhar aqui é barato; falhar no meio de uma ordem paga, não.
-  await prisma.$queryRaw`SELECT 1`;
-  const { slot, vaultLamports } = await assertSolanaReachable();
-
-  // Cria a linha de settings e semeia os destinatários na primeira subida.
-  await ensureSeeded();
-  const settings = await getSettingsView();
-
-  let split: unknown;
+async function run(): Promise<void> {
   try {
-    split = (await previewSplit(BigInt(LAMPORTS_PER_SOL))).map((p) => `${p.label}=${p.sol}`);
+    const { start } = await import('./bootstrap');
+    await start();
   } catch (err) {
-    split = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  logger.info(
-    {
-      model: 'broker',
-      vault: config.solana.vaultPublicKey.toBase58(),
-      vaultSol: lamportsToSol(vaultLamports),
-      rpcHost: new URL(config.solana.rpcEndpoint).host,
-      slot,
-      provider: config.fiat.provider,
-      inputMint: config.swap.inputMint,
-      marginBps: settings.marginBps,
-      distributionAt: `${String(settings.distributionHour).padStart(2, '0')}:${String(
-        settings.distributionMinute,
-      ).padStart(2, '0')} ${settings.distributionTimezone}`,
-      splitPreview1Sol: split,
-    },
-    'gateway inicializado',
-  );
-
-  const app = createApp();
-  server = app.listen(config.port, () => {
-    logger.info(
-      {
-        port: config.port,
-        webhook: 'POST /webhook/fiat-payment',
-        admin: 'GET /admin',
-        quote: 'GET /quote?currency=EUR&amount=100',
-      },
-      `escutando em http://localhost:${config.port}`,
-    );
-  });
-
-  // Retomada em background: não bloqueia o readiness do processo.
-  void resumeIncompleteRuns()
-    .then(() => retryPendingOrders())
-    .catch((err: unknown) => logger.error({ err }, 'retomada de trabalho inacabado falhou'));
-
-  await startScheduler();
-}
-
-async function shutdown(signal: string, exitCode = 0): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  logger.info({ signal }, 'encerrando');
-
-  const timer = setTimeout(() => {
-    logger.error('shutdown excedeu 15s — encerrando à força');
-    process.exit(1);
-  }, 15_000);
-  timer.unref();
-
-  try {
-    stopScheduler();
-    if (server) {
-      await new Promise<void>((resolve, reject) => {
-        server!.close((err) => (err ? reject(err) : resolve()));
-      });
+    if (err instanceof Error && err.name === 'ConfigError') {
+      console.error(`\n[config] ${err.message}\n`);
+      console.error('Corrija o .env (ou as variáveis de ambiente do host) e suba de novo.\n');
+      process.exit(1);
     }
-    await disconnectDatabase();
-    logger.info('encerrado com sucesso');
-    process.exit(exitCode);
-  } catch (err) {
-    logger.error({ err }, 'falha no shutdown');
+    // Qualquer outra falha de boot: stack completo, é bug ou dependência fora.
+    console.error('\n[boot] falha ao inicializar:');
+    console.error(err);
     process.exit(1);
   }
 }
 
-process.on('SIGINT', () => void shutdown('SIGINT'));
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('unhandledRejection', (reason) => {
-  logger.fatal({ reason }, 'unhandledRejection');
-  void shutdown('unhandledRejection', 1);
-});
-process.on('uncaughtException', (err) => {
-  logger.fatal({ err }, 'uncaughtException');
-  void shutdown('uncaughtException', 1);
-});
-
-void main().catch((err: unknown) => {
-  logger.fatal({ err }, 'falha no boot');
-  process.exit(1);
-});
+void run();

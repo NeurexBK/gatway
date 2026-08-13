@@ -1,3 +1,4 @@
+import { config } from '../config';
 import { logger } from '../utils/logger';
 import { retryPendingOrders } from './order.service';
 import { runProfitDistribution } from './payout.service';
@@ -93,6 +94,18 @@ async function fire(scheduledFor: Date): Promise<void> {
 export async function startScheduler(): Promise<void> {
   if (started) return;
   started = true;
+
+  if (config.isServerless) {
+    // `setTimeout` de horas não sobrevive a uma função que morre após a
+    // resposta. Em serverless o disparo tem de vir de um cron EXTERNO batendo
+    // em POST /admin/api/distribution/cron — ver vercel.json e DEPLOY.md.
+    log.warn(
+      'runtime serverless: agendador in-process NÃO iniciado. ' +
+        'A distribuição depende de um cron externo chamando /admin/api/distribution/cron. ' +
+        'O horário/timezone configurados no admin são ignorados — quem manda é o cron.',
+    );
+    return;
+  }
 
   await scheduleNextRun();
 

@@ -309,6 +309,28 @@ async function markFailed(orderId: string, err: unknown): Promise<void> {
  * A distribuição do lucro NÃO acontece aqui — ela é agendada.
  */
 export async function processOrder(orderId: string): Promise<void> {
+  if (!config.runtime.allowPipeline) {
+    // As três garantias de concorrência (inFlight, mutex de swap, reserva FIFO)
+    // valem apenas dentro de UM processo. Em serverless há N instâncias, então
+    // executar aqui reintroduziria o double-spend de depósito. A ordem fica
+    // parada e visível em vez de ser processada sem rede de segurança.
+    await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        lastError:
+          'PIPELINE_DISABLED: runtime sem garantia de instância única (serverless). ' +
+          'A ordem foi registrada mas não processada. Rode o gateway num host ' +
+          'persistente, ou defina ALLOW_PIPELINE=true após trocar os locks ' +
+          'in-process por lock no banco.',
+      },
+    });
+    orderLogger(orderId).error(
+      { isServerless: config.isServerless },
+      'pipeline desabilitada neste runtime — ordem registrada, não processada',
+    );
+    return;
+  }
+
   if (inFlight.has(orderId)) {
     log.debug({ orderId }, 'ordem já em processamento — ignorando chamada concorrente');
     return;

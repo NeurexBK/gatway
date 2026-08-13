@@ -1,0 +1,58 @@
+# Render — host persistente. É o caminho recomendado: aqui o agendador
+# in-process, o mutex de swap e o guard de concorrência por ordem funcionam,
+# porque há um único processo de longa duração.
+#
+# Ver DEPLOY.md para o porquê de a Vercel não servir para a pipeline.
+
+databases:
+  - name: gateway-db
+    databaseName: gateway
+    plan: starter
+
+services:
+  - type: web
+    name: solana-fiat-gateway
+    runtime: node
+    plan: starter
+    region: frankfurt
+    branch: main
+
+    # numInstances FIXO EM 1, de propósito. Os locks de concorrência são
+    # in-process; com 2 instâncias, duas ordens podem gastar o mesmo depósito
+    # de USDC. Só aumente depois de migrar os locks para advisory lock no
+    # Postgres.
+    numInstances: 1
+
+    buildCommand: npm ci && npm run db:postgres && npx prisma migrate deploy && npm run build
+    startCommand: npm start
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PROVIDER
+        value: postgresql
+      - key: DATABASE_URL
+        fromDatabase:
+          name: gateway-db
+          property: connectionString
+
+      # Gerados pelo Render na primeira subida.
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: CRON_SECRET
+        generateValue: true
+
+      # Preencher no painel do Render (Environment → Add Secret).
+      # sync:false = o Render pede o valor em vez de versionar aqui.
+      - key: RPC_ENDPOINT
+        sync: false
+      - key: VAULT_PRIVATE_KEY
+        sync: false
+      - key: FIAT_PROVIDER_SECRET
+        sync: false
+      - key: RECIPIENTS_JSON
+        sync: false
+      - key: INPUT_MINT
+        sync: false

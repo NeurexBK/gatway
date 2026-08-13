@@ -96,6 +96,20 @@ const envSchema = z.object({
   /** Protege /admin/*. Sem isto o painel não sobe. */
   ADMIN_API_KEY: z.string().min(16, 'ADMIN_API_KEY precisa de ao menos 16 caracteres'),
 
+  /**
+   * Segredo do cron externo (Vercel Cron manda `Authorization: Bearer`).
+   * Só necessário onde o agendador in-process não funciona.
+   */
+  CRON_SECRET: z.string().min(16).optional(),
+
+  /**
+   * Libera a pipeline que move dinheiro (swap + liquidação).
+   * Default: ligada em host persistente, DESLIGADA em serverless — ver
+   * `isServerless` abaixo. Só force para `true` em serverless depois de trocar
+   * os locks in-process por lock no banco.
+   */
+  ALLOW_PIPELINE: z.string().optional(),
+
   RECIPIENTS_JSON: z.string().min(2, 'RECIPIENTS_JSON é obrigatória (seed inicial)'),
 
   // `quote-api.jup.ag/v6` foi retirado do ar (o host não resolve mais).
@@ -133,14 +147,30 @@ const envSchema = z.object({
   SPHEREPAY_API_BASE: z.string().url().default('https://api.spherepay.co'),
 });
 
+/**
+ * Erro de configuração com a lista completa do que está errado.
+ *
+ * Este módulo NÃO chama `process.exit()`. Matar o processo durante o `import`
+ * é o pior comportamento possível fora de um servidor de longa duração: numa
+ * função serverless o resultado é um `FUNCTION_INVOCATION_FAILED` opaco, sem
+ * nenhuma pista de qual variável falta. Quem importa decide o que fazer —
+ * `server.ts` encerra com a lista impressa, o handler serverless responde 503
+ * com ela em JSON.
+ */
+export class ConfigError extends Error {
+  constructor(readonly problems: string[]) {
+    super(`configuração inválida:\n${problems.map((p) => `  - ${p}`).join('\n')}`);
+    this.name = 'ConfigError';
+  }
+}
+
 const parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {
-  // Sem logger ainda: o logger depende deste módulo.
-  console.error('[config] ambiente inválido:');
-  for (const issue of parsed.error.issues) {
-    console.error(`  - ${issue.path.join('.') || '(root)'}: ${issue.message}`);
-  }
-  process.exit(1);
+  throw new ConfigError(
+    parsed.error.issues.map(
+      (issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`,
+    ),
+  );
 }
 const env = parsed.data;
 
@@ -148,12 +178,11 @@ let vaultKeypair: Keypair;
 try {
   vaultKeypair = Keypair.fromSecretKey(parseSecretKey(env.VAULT_PRIVATE_KEY));
 } catch (err) {
-  console.error(
-    `[config] VAULT_PRIVATE_KEY inválida (esperado base58 ou array de 64 bytes): ${
+  throw new ConfigError([
+    `VAULT_PRIVATE_KEY inválida (esperado base58 ou array de 64 bytes): ${
       err instanceof Error ? err.message : String(err)
     }`,
-  );
-  process.exit(1);
+  ]);
 }
 
 const recipientsSeed = (() => {
@@ -161,28 +190,44 @@ const recipientsSeed = (() => {
   try {
     json = JSON.parse(env.RECIPIENTS_JSON);
   } catch {
-    console.error('[config] RECIPIENTS_JSON não é um JSON válido');
-    process.exit(1);
+    throw new ConfigError(['RECIPIENTS_JSON não é um JSON válido']);
   }
   const result = recipientsSchema.safeParse(json);
   if (!result.success) {
-    console.error('[config] RECIPIENTS_JSON inválido:');
-    for (const issue of result.error.issues) {
-      console.error(`  - [${issue.path.join('.')}]: ${issue.message}`);
-    }
-    process.exit(1);
+    throw new ConfigError(
+      result.error.issues.map((issue) => `RECIPIENTS_JSON[${issue.path.join('.')}]: ${issue.message}`),
+    );
   }
   return result.data;
 })();
+
+/**
+ * Detecção de ambiente serverless.
+ *
+ * Importa porque três garantias do sistema dependem de um processo único e de
+ * longa duração: o agendador (`setTimeout`), o mutex de swap e o guard de
+ * concorrência por ordem. Nenhuma delas sobrevive a N instâncias efêmeras.
+ */
+const isServerless =
+  process.env.VERCEL === '1' ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME !== undefined ||
+  process.env.FUNCTIONS_WORKER_RUNTIME !== undefined;
 
 /** Mint nativo do SOL empacotado — output do swap no Jupiter. */
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 export const LAMPORTS_PER_SOL = 1_000_000_000;
 export const TOTAL_BPS = BPS_TOTAL;
 
+/** Override explícito vence a detecção; sem override, serverless => desligada. */
+const allowPipeline =
+  env.ALLOW_PIPELINE === undefined || env.ALLOW_PIPELINE === ''
+    ? !isServerless
+    : /^(1|true|yes|on)$/i.test(env.ALLOW_PIPELINE);
+
 export const config = {
   env: env.NODE_ENV,
   isProduction: env.NODE_ENV === 'production',
+  isServerless,
   port: env.PORT,
   logLevel: env.LOG_LEVEL,
 
@@ -201,6 +246,7 @@ export const config = {
 
   admin: {
     apiKey: env.ADMIN_API_KEY,
+    ...(env.CRON_SECRET !== undefined ? { cronSecret: env.CRON_SECRET } : { cronSecret: '' }),
   },
 
   swap: {
@@ -229,6 +275,8 @@ export const config = {
     maxAttempts: env.MAX_ATTEMPTS,
     depositWaitTimeoutMs: env.DEPOSIT_WAIT_TIMEOUT_MS,
     maxOrderInputRaw: BigInt(env.MAX_ORDER_INPUT_RAW),
+    /** Quando false, nenhuma etapa que move dinheiro executa. */
+    allowPipeline,
   },
 
   feeProviders: {

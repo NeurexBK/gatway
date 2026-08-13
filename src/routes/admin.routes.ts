@@ -252,6 +252,60 @@ router.get('/api/runs', ah(async (_req: Request, res: Response) => {
   res.json({ runs: await listRuns(20) });
 }));
 
+/**
+ * Disparo por cron EXTERNO (Vercel Cron, GitHub Actions, cron do sistema).
+ *
+ * Autenticado por `CRON_SECRET`, não pela chave do admin — o cron não deve
+ * carregar a credencial que edita o split. Vercel Cron manda
+ * `Authorization: Bearer $CRON_SECRET` automaticamente.
+ *
+ * Fica FORA de `/api` (que exige a chave do admin) de propósito, e é montado
+ * antes do middleware por isso.
+ */
+// Vercel Cron invoca com GET; cron de sistema/CI costuma usar POST. Aceita os dois.
+router.all('/cron/distribute', ah(async (req: Request, res: Response) => {
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return res.status(405).json({ error: 'method_not_allowed' });
+  }
+  const secret = config.admin.cronSecret;
+  if (!secret) {
+    return res.status(503).json({
+      error: 'cron_not_configured',
+      message: 'CRON_SECRET não definida — disparo por cron desabilitado',
+    });
+  }
+
+  const header = req.headers.authorization;
+  const provided = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!constantTimeEquals(provided, secret)) {
+    log.warn({ ip: req.ip }, 'disparo de cron rejeitado');
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  // Guarda contra reentrega do cron: se já houve execução nas últimas 12h,
+  // não roda de novo.
+  const recent = await prisma.payoutRun.findFirst({
+    where: {
+      trigger: 'CRON',
+      createdAt: { gte: new Date(Date.now() - 12 * 60 * 60 * 1_000) },
+      status: { in: ['COMPLETED', 'SKIPPED'] },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (recent) {
+    return res.json({
+      skipped: true,
+      reason: 'já houve execução por cron nas últimas 12h',
+      lastRunId: recent.id,
+      lastRunAt: recent.createdAt.toISOString(),
+    });
+  }
+
+  log.info('distribuição disparada por cron externo');
+  const summary = await runProfitDistribution({ trigger: 'CRON' });
+  return res.json(summary);
+}));
+
 router.post('/api/distribution/run-now', ah(async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { ignoreMinimum?: boolean };
   log.warn({ ignoreMinimum: Boolean(body.ignoreMinimum) }, 'distribuição manual disparada pelo admin');

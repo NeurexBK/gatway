@@ -93,7 +93,15 @@ existe é o equivalente prático:
 | **Falha parcial não redistribui** | Se um lote saiu e outro não, o run fica `PARTIAL` e é retomado — nunca reiniciado do zero. |
 | **Conservação de valor** | `sum(allocations) === total`, sempre. Resto da divisão inteira para o maior bps. |
 
-## Setup
+## Deploy
+
+Ver **[DEPLOY.md](DEPLOY.md)**. Resumo: **use um host com processo persistente**
+(Render, Railway, Fly.io, VPS). Em serverless (Vercel) a API sobe e o painel
+funciona, mas a pipeline que move dinheiro fica **desligada** de propósito — os
+locks de concorrência e o agendador dependem de um processo único de longa
+duração. `render.yaml` e `Dockerfile` estão prontos no repo.
+
+## Setup local
 
 ```bash
 npm install

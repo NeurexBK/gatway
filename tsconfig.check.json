@@ -1,0 +1,12 @@
+{
+  // Typecheck-only: inclui `api/` (entrypoint serverless), que fica fora do
+  // rootDir de `src` e portanto não entra no build normal. A Vercel compila
+  // `api/` por conta própria — este arquivo garante que os erros aparecem aqui
+  // antes, não no deploy.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "api/**/*.ts", "scripts/**/*.ts"]
+}
