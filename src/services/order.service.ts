@@ -10,6 +10,7 @@ import {
 import { orderLogger, logger } from '../utils/logger';
 import { sendLamports } from './distribution.service';
 import { resolveEffectiveFee } from './fee.service';
+import { LOCK_NAMES, withLock, withLockOrThrow } from './lock.service';
 import { swapToSol } from './jupiter.service';
 import { getTokenBalanceRaw, waitForTokenBalance } from './solana.service';
 
@@ -31,26 +32,23 @@ import { getTokenBalanceRaw, waitForTokenBalance } from './solana.service';
 
 const log = logger.child({ scope: 'orders' });
 
-/** Guarda contra processamento concorrente da MESMA ordem. */
-const inFlight = new Set<string>();
-
 /**
- * Serializa os swaps do processo inteiro.
+ * Serializa a sequência "verificar saldo não reservado -> swapar".
  *
- * Sem isto, duas ordens concorrentes leem o mesmo saldo de USDC do vault,
- * ambas se julgam cobertas e ambas fazem swap — a segunda gastando dinheiro
- * que pertence à primeira. O mutex torna a sequência "verificar saldo não
- * reservado -> swapar" indivisível dentro do processo.
+ * Sem isto, duas ordens concorrentes leem o mesmo saldo de USDC do vault, ambas
+ * se julgam cobertas e ambas fazem swap — a segunda gastando dinheiro que
+ * pertence à primeira.
  *
- * Limitação conhecida: é in-process. Com mais de uma instância, isto precisa
- * virar lock no banco (advisory lock no Postgres).
+ * É lock no BANCO, não mutex em memória: com múltiplas instâncias (o caso normal
+ * em serverless) um mutex in-process não exclui nada. TTL generoso porque a
+ * seção crítica inclui cotação e broadcast na Solana.
  */
-let swapChain: Promise<unknown> = Promise.resolve();
-function withSwapLock<T>(fn: () => Promise<T>): Promise<T> {
-  const result = swapChain.then(fn, fn);
-  // A cadeia ignora o resultado (e o erro) para não travar as próximas ordens.
-  swapChain = result.catch(() => undefined);
-  return result;
+function withSwapLock<T>(fn: () => Promise<T>, orderId: string): Promise<T> {
+  return withLockOrThrow(LOCK_NAMES.SWAP, fn, {
+    ttlMs: 180_000,
+    waitMs: 30_000,
+    meta: `order=${orderId}`,
+  });
 }
 
 // ─────────────────────────── Criação (idempotente) ───────────────────────────
@@ -200,9 +198,21 @@ async function assertDepositIsUnreserved(order: Order): Promise<void> {
 async function stepSwap(order: Order): Promise<Order> {
   const olog = orderLogger(order.id, { step: 'swap' });
 
-  // O webhook confirma o fiat; o settlement on-chain pode aterrar depois.
-  olog.info({ inputAmountRaw: order.inputAmountRaw.toString() }, 'aguardando depósito no vault');
-  await waitForTokenBalance(order.inputMint, order.inputAmountRaw);
+  // O webhook confirma o fiat; o settlement on-chain pode aterrar depois. Em
+  // serverless a espera é curta de propósito (o orçamento da invocação); se o
+  // depósito não chegar, a ordem fica PENDING e o próximo tick do cron retoma.
+  olog.info(
+    {
+      inputAmountRaw: order.inputAmountRaw.toString(),
+      waitBudgetMs: config.runtime.depositWaitBudgetMs,
+    },
+    'aguardando depósito no vault',
+  );
+  await waitForTokenBalance(
+    order.inputMint,
+    order.inputAmountRaw,
+    config.runtime.depositWaitBudgetMs,
+  );
 
   const result = await withSwapLock(async () => {
     // Verificação e swap sob o mesmo lock: entre uma e outra ninguém mais
@@ -210,7 +220,7 @@ async function stepSwap(order: Order): Promise<Order> {
     await assertDepositIsUnreserved(order);
     olog.info('depósito confirmado e não reservado — swapando');
     return swapToSol(order.inputAmountRaw, { orderId: order.id });
-  });
+  }, order.id);
 
   return prisma.order.update({
     where: { id: order.id },
@@ -310,32 +320,36 @@ async function markFailed(orderId: string, err: unknown): Promise<void> {
  */
 export async function processOrder(orderId: string): Promise<void> {
   if (!config.runtime.allowPipeline) {
-    // As três garantias de concorrência (inFlight, mutex de swap, reserva FIFO)
-    // valem apenas dentro de UM processo. Em serverless há N instâncias, então
-    // executar aqui reintroduziria o double-spend de depósito. A ordem fica
-    // parada e visível em vez de ser processada sem rede de segurança.
+    // Kill switch explícito (ALLOW_PIPELINE=false). A ordem fica registrada e
+    // visível em vez de ser processada.
     await prisma.order.update({
       where: { id: orderId },
       data: {
         lastError:
-          'PIPELINE_DISABLED: runtime sem garantia de instância única (serverless). ' +
-          'A ordem foi registrada mas não processada. Rode o gateway num host ' +
-          'persistente, ou defina ALLOW_PIPELINE=true após trocar os locks ' +
-          'in-process por lock no banco.',
+          'PIPELINE_DISABLED: ALLOW_PIPELINE=false. A ordem foi registrada mas ' +
+          'não processada.',
       },
     });
-    orderLogger(orderId).error(
-      { isServerless: config.isServerless },
-      'pipeline desabilitada neste runtime — ordem registrada, não processada',
-    );
+    orderLogger(orderId).error('pipeline desabilitada por configuração — ordem não processada');
     return;
   }
 
-  if (inFlight.has(orderId)) {
-    log.debug({ orderId }, 'ordem já em processamento — ignorando chamada concorrente');
-    return;
+  // Lock por ordem, no banco: duas invocações concorrentes (reentrega de
+  // webhook, cron sobrepondo o webhook, duas instâncias serverless) nunca
+  // processam a mesma ordem em paralelo. Tentativa única — se outro já está
+  // cuidando dela, não há motivo para esperar.
+  const outcome = await withLock(
+    LOCK_NAMES.order(orderId),
+    () => processOrderLocked(orderId),
+    { ttlMs: 300_000, meta: 'processOrder' },
+  );
+
+  if (!outcome.acquired) {
+    log.debug({ orderId }, 'ordem já sendo processada por outra instância — ignorando');
   }
-  inFlight.add(orderId);
+}
+
+async function processOrderLocked(orderId: string): Promise<void> {
   const olog = orderLogger(orderId);
 
   try {
@@ -395,9 +409,9 @@ export async function processOrder(orderId: string): Promise<void> {
       { err: err instanceof Error ? err.message : String(err), attempts },
       'etapa falhou — ordem devolvida para retomada',
     );
-  } finally {
-    inFlight.delete(orderId);
   }
+  // Sem `finally` para soltar guarda em memória: o lock por ordem é liberado
+  // pelo `withLock` em processOrder, inclusive quando isto lança.
 }
 
 /**
@@ -408,7 +422,12 @@ export async function processOrder(orderId: string): Promise<void> {
  * disponível no vault; caso contrário exigimos revisão manual em vez de
  * arriscar um segundo swap.
  */
-export async function retryPendingOrders(): Promise<void> {
+export async function retryPendingOrders(
+  options: { budgetMs?: number } = {},
+): Promise<{ found: number; processed: number; budgetExhausted: boolean }> {
+  const { budgetMs } = options;
+  const deadline = budgetMs !== undefined ? Date.now() + Math.max(budgetMs, 0) : Number.MAX_SAFE_INTEGER;
+
   const orders = await prisma.order.findMany({
     where: {
       status: { in: [OrderStatus.PENDING, OrderStatus.PROCESSING, OrderStatus.SWAPPED] },
@@ -418,10 +437,21 @@ export async function retryPendingOrders(): Promise<void> {
     take: 50,
   });
 
-  if (orders.length === 0) return;
+  if (orders.length === 0) return { found: 0, processed: 0, budgetExhausted: false };
   log.info({ count: orders.length }, 'retomando ordens inacabadas');
 
+  let processed = 0;
+
   for (const order of orders) {
+    // Orçamento estourado (invocação serverless): para e deixa o resto para o
+    // próximo tick, em vez de ser morto no meio de um swap.
+    if (Date.now() >= deadline) {
+      log.warn(
+        { processed, remaining: orders.length - processed },
+        'orçamento esgotado — resto das ordens fica para o próximo tick',
+      );
+      return { found: orders.length, processed, budgetExhausted: true };
+    }
     if (order.status === OrderStatus.PROCESSING && order.swapSignature === null) {
       const tokenBalance = await getTokenBalanceRaw(order.inputMint).catch(() => 0n);
       if (tokenBalance < order.inputAmountRaw) {
@@ -440,7 +470,10 @@ export async function retryPendingOrders(): Promise<void> {
       }
     }
     await processOrder(order.id);
+    processed += 1;
   }
+
+  return { found: orders.length, processed, budgetExhausted: false };
 }
 
 // ─────────────────────────── Consultas ───────────────────────────

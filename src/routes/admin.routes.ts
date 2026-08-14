@@ -7,8 +7,14 @@ import { logger } from '../utils/logger';
 import { jsonSafe } from '../utils/serialize';
 import { previewSplit } from '../services/distribution.service';
 import { adapterStatus, compareProviderFees, recentFeeSnapshots, resolveEffectiveFee } from '../services/fee.service';
-import { getAccruedProfit, getOrderStats } from '../services/order.service';
-import { hasPartialRuns, listRuns, runProfitDistribution } from '../services/payout.service';
+import { listLocks, pruneExpiredLocks } from '../services/lock.service';
+import { getAccruedProfit, getOrderStats, retryPendingOrders } from '../services/order.service';
+import {
+  hasPartialRuns,
+  listRuns,
+  resumeIncompleteRuns,
+  runProfitDistribution,
+} from '../services/payout.service';
 import { getNextRunAt, scheduleNextRun } from '../services/scheduler.service';
 import {
   getRecipients,
@@ -252,6 +258,11 @@ router.get('/api/runs', ah(async (_req: Request, res: Response) => {
   res.json({ runs: await listRuns(20) });
 }));
 
+/** Locks ativos — diagnóstico de concorrência ("por que a ordem não anda?"). */
+router.get('/api/locks', ah(async (_req: Request, res: Response) => {
+  res.json({ locks: await listLocks() });
+}));
+
 /**
  * Disparo por cron EXTERNO (Vercel Cron, GitHub Actions, cron do sistema).
  *
@@ -262,8 +273,8 @@ router.get('/api/runs', ah(async (_req: Request, res: Response) => {
  * Fica FORA de `/api` (que exige a chave do admin) de propósito, e é montado
  * antes do middleware por isso.
  */
-// Vercel Cron invoca com GET; cron de sistema/CI costuma usar POST. Aceita os dois.
-router.all('/cron/distribute', ah(async (req: Request, res: Response) => {
+/** Valida o segredo do cron. Devolve a resposta de erro, ou null se ok. */
+function checkCronAuth(req: Request, res: Response): Response | null {
   if (req.method !== 'GET' && req.method !== 'POST') {
     return res.status(405).json({ error: 'method_not_allowed' });
   }
@@ -274,32 +285,72 @@ router.all('/cron/distribute', ah(async (req: Request, res: Response) => {
       message: 'CRON_SECRET não definida — disparo por cron desabilitado',
     });
   }
-
   const header = req.headers.authorization;
   const provided = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7) : '';
   if (!constantTimeEquals(provided, secret)) {
-    log.warn({ ip: req.ip }, 'disparo de cron rejeitado');
+    log.warn({ ip: req.ip, path: req.path }, 'disparo de cron rejeitado');
     return res.status(401).json({ error: 'unauthorized' });
   }
+  return null;
+}
 
-  // Guarda contra reentrega do cron: se já houve execução nas últimas 12h,
-  // não roda de novo.
-  const recent = await prisma.payoutRun.findFirst({
-    where: {
-      trigger: 'CRON',
-      createdAt: { gte: new Date(Date.now() - 12 * 60 * 60 * 1_000) },
-      status: { in: ['COMPLETED', 'SKIPPED'] },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
-  if (recent) {
-    return res.json({
-      skipped: true,
-      reason: 'já houve execução por cron nas últimas 12h',
-      lastRunId: recent.id,
-      lastRunAt: recent.createdAt.toISOString(),
-    });
+/**
+ * Tick do cron — o "processo de fundo" de um runtime serverless.
+ *
+ * Num host persistente isto é feito por timers dentro do processo. Em
+ * serverless não há processo entre requisições, então tudo que é periódico tem
+ * de ser puxado de fora:
+ *
+ *  1. retoma execuções de distribuição interrompidas;
+ *  2. retoma ordens que não terminaram (depósito que aterrou depois do
+ *     orçamento da invocação do webhook, erro transitório);
+ *  3. roda a distribuição de lucro, se houver o que distribuir;
+ *  4. limpa locks expirados.
+ *
+ * Idempotente: pode ser chamado com qualquer frequência. Cada etapa é protegida
+ * por lock no banco, então dois ticks sobrepostos não duplicam trabalho.
+ */
+router.all('/cron/tick', ah(async (req: Request, res: Response) => {
+  const denied = checkCronAuth(req, res);
+  if (denied) return denied;
+
+  const startedAt = Date.now();
+  const budget = config.runtime.serverlessBudgetMs;
+  const steps: Record<string, unknown> = {};
+
+  try {
+    await resumeIncompleteRuns();
+    steps.resumeIncompleteRuns = 'ok';
+  } catch (err) {
+    steps.resumeIncompleteRuns = err instanceof Error ? err.message : String(err);
   }
+
+  try {
+    const processed = await retryPendingOrders({ budgetMs: budget - (Date.now() - startedAt) });
+    steps.retryPendingOrders = processed;
+  } catch (err) {
+    steps.retryPendingOrders = err instanceof Error ? err.message : String(err);
+  }
+
+  try {
+    steps.distribution = await runProfitDistribution({ trigger: 'CRON' });
+  } catch (err) {
+    steps.distribution = err instanceof Error ? err.message : String(err);
+  }
+
+  try {
+    steps.prunedLocks = await pruneExpiredLocks();
+  } catch (err) {
+    steps.prunedLocks = err instanceof Error ? err.message : String(err);
+  }
+
+  return res.json({ ok: true, elapsedMs: Date.now() - startedAt, steps });
+}));
+
+/** Só a distribuição, sem a varredura de ordens. */
+router.all('/cron/distribute', ah(async (req: Request, res: Response) => {
+  const denied = checkCronAuth(req, res);
+  if (denied) return denied;
 
   log.info('distribuição disparada por cron externo');
   const summary = await runProfitDistribution({ trigger: 'CRON' });

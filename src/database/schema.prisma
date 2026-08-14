@@ -11,6 +11,10 @@
 
 generator client {
   provider = "prisma-client-js"
+  // `rhel-openssl-3.0.x` é o runtime Node da Vercel/Lambda. Sem ele, o client
+  // gerado numa máquina de build diferente da de execução não encontra o query
+  // engine — falha clássica de Prisma em serverless.
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
 }
 
 datasource db {
@@ -179,6 +183,30 @@ model GatewaySettings {
   fallbackProviderCostBps Int @default(200)
 
   updatedAt DateTime @updatedAt
+}
+
+/// Lock distribuído com lease (arrendamento).
+///
+/// Substitui os locks in-process, que não valem nada quando há mais de uma
+/// instância — o caso normal em serverless. A exclusão vem do PRIMARY KEY:
+/// `create` de um `name` que já existe falha atomicamente no banco, então
+/// exatamente um processo ganha.
+///
+/// `expiresAt` evita lock eterno se o processo morrer no meio (função
+/// serverless que estoura o tempo, container morto): passado o prazo, outro
+/// processo pode roubar o lock. O `owner` garante que quem perdeu o lease não
+/// libere o lock de quem o roubou.
+model Lock {
+  /// Ex.: "order:cuid...", "swap:global", "payout:global".
+  name      String   @id
+  /// Identificador aleatório de quem detém o lease.
+  owner     String
+  expiresAt DateTime
+  acquiredAt DateTime @default(now())
+  /// Só para diagnóstico no admin.
+  meta      String?
+
+  @@index([expiresAt])
 }
 
 /// Cache das taxas coletadas dos on-ramps — histórico de quem estava mais

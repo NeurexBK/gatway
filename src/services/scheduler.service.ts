@@ -1,5 +1,6 @@
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import { pruneExpiredLocks } from './lock.service';
 import { retryPendingOrders } from './order.service';
 import { runProfitDistribution } from './payout.service';
 import { computeNextRunAt, getSettings } from './settings.service';
@@ -101,8 +102,9 @@ export async function startScheduler(): Promise<void> {
     // em POST /admin/api/distribution/cron — ver vercel.json e DEPLOY.md.
     log.warn(
       'runtime serverless: agendador in-process NÃO iniciado. ' +
-        'A distribuição depende de um cron externo chamando /admin/api/distribution/cron. ' +
-        'O horário/timezone configurados no admin são ignorados — quem manda é o cron.',
+        'A distribuição e a retomada de ordens dependem de um cron externo ' +
+        'chamando GET /admin/cron/tick. O horário/timezone configurados no admin ' +
+        'são ignorados neste runtime — quem manda é o schedule do cron.',
     );
     return;
   }
@@ -110,9 +112,9 @@ export async function startScheduler(): Promise<void> {
   await scheduleNextRun();
 
   sweepTimer = setInterval(() => {
-    void retryPendingOrders().catch((err: unknown) =>
-      log.error({ err }, 'varredura de ordens pendentes falhou'),
-    );
+    void retryPendingOrders()
+      .then(() => pruneExpiredLocks())
+      .catch((err: unknown) => log.error({ err }, 'varredura de ordens pendentes falhou'));
   }, SWEEP_INTERVAL_MS);
   sweepTimer.unref();
 

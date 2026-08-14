@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { config } from '../config';
 import { prisma } from '../database/client';
 import { GatewayError, OrderStatus } from '../types';
 import { logger } from '../utils/logger';
@@ -81,8 +82,57 @@ router.post('/fiat-payment', ah(async (req: Request, res: Response) => {
     throw err;
   }
 
-  // 5) Dispara a pipeline sem bloquear a resposta.
-  if (created || status === OrderStatus.PENDING || status === OrderStatus.SWAPPED) {
+  // 5) Dispara a pipeline.
+  const shouldProcess =
+    created || status === OrderStatus.PENDING || status === OrderStatus.SWAPPED;
+
+  if (shouldProcess && config.isServerless) {
+    /**
+     * Em serverless a pipeline roda ANTES da resposta.
+     *
+     * Não existe background aqui: depois do `res.end()` a função pode ser
+     * congelada ou morta, então `setImmediate` não garante execução alguma — a
+     * ordem ficaria registrada e nunca processada. O custo é uma resposta mais
+     * lenta ao provedor; o teto é `serverlessBudgetMs`, e o que não terminar
+     * dentro dele é retomado pelo tick do cron.
+     */
+    const budget = config.runtime.serverlessBudgetMs;
+    const started = Date.now();
+    let timedOut = false;
+
+    await Promise.race([
+      processOrder(orderId).catch((err: unknown) =>
+        log.error({ orderId, err }, 'processOrder falhou'),
+      ),
+      new Promise<void>((resolve) =>
+        setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, budget),
+      ),
+    ]);
+
+    const fresh = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { status: true },
+    });
+
+    return res.status(202).json({
+      received: true,
+      acted: true,
+      duplicate: !created,
+      orderId,
+      status: fresh?.status ?? status,
+      processedInline: true,
+      elapsedMs: Date.now() - started,
+      ...(timedOut
+        ? { note: 'orçamento da invocação esgotado — o restante será retomado pelo cron' }
+        : {}),
+    });
+  }
+
+  if (shouldProcess) {
+    // Host persistente: responde já e processa em background, que aqui é real.
     setImmediate(() => {
       void processOrder(orderId).catch((err: unknown) =>
         log.error({ orderId, err }, 'processOrder estourou fora do handler'),

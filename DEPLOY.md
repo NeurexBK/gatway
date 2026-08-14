@@ -1,65 +1,89 @@
 # Deploy
 
-## Resumo curto
-
-**A Vercel não é o host certo para este backend.** Ela agora funciona sem
-crashar, e serve `/health`, `/quote` e o painel admin — mas a parte que move
-dinheiro fica **desligada** lá, de propósito. Para o gateway completo use um host
-com processo persistente (Render, Railway, Fly.io, VPS).
+A pipeline completa funciona nos dois runtimes. O que muda é **como** o trabalho
+periódico é disparado e quanto tempo cada invocação tem.
 
 | | Vercel (serverless) | Host persistente |
 |---|---|---|
 | `/health`, `/quote`, painel admin | funciona | funciona |
 | Webhook registra a ordem | funciona | funciona |
-| Swap + liquidação do cliente | **desligado** | funciona |
-| Distribuição diária de lucro | via cron externo, horário em UTC | horário/timezone do admin |
+| Swap + liquidação do cliente | funciona (inline, com teto de tempo) | funciona (background) |
+| Distribuição de lucro | cron externo, horário em **UTC** | horário/timezone do admin |
+| Retomada de ordens | cron externo (`/admin/cron/tick`) | varredura a cada 5 min |
 | Banco | Postgres obrigatório | SQLite (dev) ou Postgres |
+| Exclusão mútua | lock no banco | lock no banco |
 
-## Por que a pipeline fica desligada em serverless
+## Como a concorrência é garantida
 
-Três garantias do sistema dependem de **um processo único e de longa duração**:
+Isto é o que torna serverless viável, e vale entender antes de confiar:
 
-1. `inFlight` — impede processar a mesma ordem duas vezes em paralelo;
-2. o **mutex de swap** — torna indivisível a sequência "verificar saldo não
-   reservado → swapar";
-3. o **agendador** — um `setTimeout` de horas até o horário configurado.
+O saldo de USDC do vault é um pote comum — on-chain não há como saber qual
+depósito pertence a qual ordem. Sem exclusão real, duas ordens simultâneas leem
+o mesmo saldo, ambas se julgam cobertas, e a segunda gasta o dinheiro da
+primeira.
 
-Serverless roda N instâncias efêmeras. As duas primeiras deixam de valer, e o
-resultado é o double-spend de depósito: duas ordens gastando o mesmo USDC. A
-terceira simplesmente nunca dispara.
+A exclusão vem da tabela `Lock` (`src/services/lock.service.ts`), não de
+estruturas em memória:
 
-Por isso `config.runtime.allowPipeline` é `false` quando o runtime é detectado
-como serverless. O webhook continua respondendo `202` e **registra** a ordem —
-nada de pagamento perdido — mas ela fica em `PENDING` com
-`lastError: PIPELINE_DISABLED` em vez de ser processada sem rede de segurança.
+- **exclusão** pelo PRIMARY KEY: dois `INSERT` concorrentes do mesmo nome — um
+  ganha, o outro recebe violação de unicidade. Não existe janela entre
+  "verificar" e "criar", que é o furo de qualquer implementação com SELECT+INSERT;
+- **lease com expiração**: se o detentor morrer (função que estoura o tempo,
+  container derrubado), o lock não fica preso — passado o prazo, outro processo
+  rouba, e o roubo é atômico (`UPDATE ... WHERE expiresAt < now`);
+- **liberação por dono**: quem já perdeu o lease não libera o lock de quem o
+  roubou.
 
-Para habilitar em serverless você precisa antes trocar os locks in-process por
-lock no banco (advisory lock no Postgres). Depois disso, `ALLOW_PIPELINE=true`.
-Não force esse flag antes disso.
+Três locks: `swap:global` (serializa "verificar saldo → swapar"),
+`payout:global` (uma distribuição por vez) e `order:<id>` (uma ordem por vez).
+
+Verificado com 3 processos separados disputando a mesma seção crítica: 18
+entradas, máximo simultâneo 1, zero violações. `GET /admin/api/locks` mostra os
+locks ativos.
+
+`ALLOW_PIPELINE=false` continua disponível como kill switch operacional.
+
+## Duas diferenças reais em serverless
+
+**1. O webhook processa antes de responder.** Não existe background numa função
+serverless: depois do `res.end()` ela pode ser congelada ou morta, então
+`setImmediate` não garante execução alguma. A pipeline roda inline, com teto de
+`SERVERLESS_BUDGET_MS` (default 45s). O provedor espera mais pela resposta; o que
+não terminar no prazo fica para o tick do cron. A resposta traz
+`processedInline: true` e `elapsedMs`.
+
+**2. A espera pelo depósito é curta.** Em serverless ela é limitada a metade do
+orçamento da invocação (em vez dos 180s do default), porque não cabe. Se o
+settlement do on-ramp aterrar depois disso, a ordem fica `PENDING` e **só avança
+no próximo tick do cron**. Com cron diário, isso significa que um cliente pode
+esperar até 24h.
+
+Se você opera de verdade na Vercel, resolva o segundo ponto com um tick
+frequente. O endpoint é idempotente e protegido por lock, então pode ser chamado
+de minuto em minuto:
+
+- **Vercel Pro:** troque o `schedule` no `vercel.json` para `*/5 * * * *`;
+- **plano Hobby** (limite de 2 crons/dia): use um pinger externo — cron-job.org,
+  GitHub Actions com `schedule`, ou Upstash QStash — chamando
+  `GET https://SEU-APP.vercel.app/admin/cron/tick` com o header
+  `Authorization: Bearer $CRON_SECRET`.
 
 ---
 
-## Opção A — Render (recomendado)
+## Opção A — Render (mais simples)
 
-Processo persistente, uma instância, Postgres gerenciado. Tudo funciona.
+Processo persistente, Postgres gerenciado, horário do admin funcionando.
 
-1. **Postgres:** crie um Postgres no Render e copie a *Internal Database URL*.
-2. **Serviço web:** conecte o repo e configure:
-   - Build: `npm install && npm run db:postgres && npx prisma migrate deploy && npm run build`
-   - Start: `npm start`
-   - Instâncias: **1** (importante — ver acima)
-3. **Variáveis de ambiente:** as da tabela abaixo, com `DATABASE_URL` do passo 1.
+`render.yaml` já está no repo — o Render lê o arquivo e provisiona serviço e
+banco. Preencha os segredos marcados `sync: false` no painel.
 
-Na primeira subida, em vez de `migrate deploy`, gere a migration inicial:
+Na primeira subida, gere a migration inicial:
 
 ```bash
 npm run db:postgres
 npx prisma migrate dev --name init
 git add -A && git commit -m "chore(db): migration inicial postgres"
 ```
-
-`render.yaml` no repo já traz isso pronto — o Render lê o arquivo e provisiona
-o serviço e o banco sozinho.
 
 ## Opção B — Docker (VPS, Fly.io, Railway)
 
@@ -68,34 +92,36 @@ docker build -t solana-fiat-gateway .
 docker run -p 3000:3000 --env-file .env solana-fiat-gateway
 ```
 
-Uma réplica só. Se escalar horizontalmente, os locks precisam ir para o banco
-primeiro.
+## Opção C — Vercel
 
-## Opção C — Vercel (só a superfície de API)
+1. **Postgres.** SQLite não funciona: disco efêmero. Use Neon, Supabase ou
+   Vercel Postgres.
 
-Já está configurada: `vercel.json` + `api/index.ts`.
+   Serverless abre muitas conexões curtas, então use a **connection string com
+   pooler** e limite o pool do Prisma:
 
-1. **Postgres obrigatório.** SQLite não funciona: o disco é efêmero e o banco
-   desapareceria entre invocações. Use Neon, Supabase ou Vercel Postgres e
-   coloque a connection string em `DATABASE_URL`.
-2. **Variáveis de ambiente** no painel: Settings → Environment Variables.
-   Faltando qualquer uma, a função responde **503 com a lista exata do que
-   falta** em JSON — não mais o `FUNCTION_INVOCATION_FAILED` opaco.
-3. **Migration:** rode do seu terminal, apontando para o Postgres de produção:
-   ```bash
-   npm run db:postgres && npx prisma migrate deploy
    ```
-4. **Cron:** `vercel.json` já registra um cron diário em `0 0 * * *` batendo em
-   `/admin/cron/distribute`, autenticado por `CRON_SECRET`. Defina essa
-   variável, ou o endpoint responde 503 e nada é distribuído.
+   DATABASE_URL="postgresql://...pooler.../db?pgbouncer=true&connection_limit=1"
+   ```
 
-Duas ressalvas sobre o cron na Vercel:
+   Para migrations, use a URL **direta** (sem pooler), do seu terminal:
 
-- **o horário passa a ser o do cron, em UTC.** Os campos de hora/timezone do
-  painel admin deixam de mandar — o agendador in-process não roda lá. Ajuste o
-  `schedule` no `vercel.json`, não o admin.
-- **plano Hobby limita cron a 2 invocações/dia.** Por isso o default é diário e
-  não a cada hora.
+   ```bash
+   npm run db:postgres
+   DATABASE_URL="postgresql://...direta.../db" npx prisma migrate deploy
+   ```
+
+2. **Variáveis de ambiente** no painel (Settings → Environment Variables).
+   Faltando qualquer uma, a função responde **503 com a lista exata do que
+   falta** em JSON — não um 500 opaco.
+
+3. **`CRON_SECRET`** é obrigatória para o tick funcionar; sem ela o endpoint
+   responde 503 e nada é distribuído nem retomado.
+
+4. **Confirme o `maxDuration` do seu plano.** O `vercel.json` pede 60s. Se o seu
+   plano permitir menos, baixe `SERVERLESS_BUDGET_MS` para uns 5s abaixo do
+   limite real, ou a invocação é morta no meio da pipeline (o trabalho é
+   retomável, mas você queima tempo).
 
 ---
 
@@ -117,21 +143,30 @@ Relevantes para deploy:
 
 | Variável | Default | Para quê |
 |---|---|---|
-| `CRON_SECRET` | — | Autentica o cron externo. Sem ela, `/admin/cron/distribute` responde 503. |
-| `ALLOW_PIPELINE` | ligada em host persistente, desligada em serverless | Override manual. Só ligue em serverless após trocar os locks. |
-| `NODE_ENV` | `development` | Em `production` o log sai em JSON e erros internos não vazam detalhe. |
-| `DATABASE_PROVIDER` | — | Lido por `scripts/set-db-provider.js` quando nenhum argumento é passado. |
-
-Gerar segredos:
+| `CRON_SECRET` | — | Autentica `/admin/cron/tick` e `/admin/cron/distribute`. |
+| `SERVERLESS_BUDGET_MS` | `45000` | Teto de trabalho por invocação. Mantenha abaixo do `maxDuration`. |
+| `ALLOW_PIPELINE` | ligada | Kill switch. `false` registra ordens sem processá-las. |
+| `NODE_ENV` | `development` | Em `production`: log JSON e sem detalhe de erro interno na resposta. |
+| `DATABASE_PROVIDER` | — | Lido por `scripts/set-db-provider.js` sem argumento. |
 
 ```bash
 node -e "console.log('ADMIN_API_KEY=admin_'+require('crypto').randomBytes(24).toString('hex'))"
 node -e "console.log('CRON_SECRET=cron_'+require('crypto').randomBytes(24).toString('hex'))"
 ```
 
+## Endpoints de cron
+
+| Rota | O que faz |
+|---|---|
+| `GET\|POST /admin/cron/tick` | Retoma execuções interrompidas, retoma ordens pendentes, distribui lucro se houver, limpa locks expirados. **Use este.** |
+| `GET\|POST /admin/cron/distribute` | Só a distribuição. |
+
+Ambos autenticados por `Authorization: Bearer $CRON_SECRET`, idempotentes e
+protegidos por lock — chamar em paralelo não duplica trabalho.
+
 ## Trocar SQLite ↔ Postgres
 
-O Prisma **não** aceita `env()` no `provider` do datasource (verificado na 5.22),
+O Prisma não aceita `env()` no `provider` do datasource (verificado na 5.22),
 então a troca é por script sobre um schema único:
 
 ```bash
@@ -139,7 +174,8 @@ npm run db:postgres   # produção
 npm run db:sqlite     # dev local
 ```
 
-O script é idempotente e o `buildCommand` do `vercel.json` já o chama.
+O `buildCommand` do `vercel.json` já chama o script. O `binaryTargets` do schema
+inclui `rhel-openssl-3.0.x` (runtime da Vercel/Lambda) além de `native`.
 
 ## Checklist antes do primeiro euro real
 
@@ -149,7 +185,8 @@ Nada disto é opcional:
       proposital entre swap e liquidação e entre dois lotes da distribuição
 - [ ] `VAULT_PRIVATE_KEY` fora de variável de ambiente (KMS/HSM)
 - [ ] cada evento de webhook confirmado contra a API do provedor por `paymentId`
-- [ ] uma instância só, ou locks migrados para o banco
+      — hoje o HMAC é a única prova de que o pagamento existiu
+- [ ] tick frequente configurado, se estiver em serverless
 - [ ] alerta externo para `PayoutRun` em `PARTIAL` e ordens em `FAILED`
 - [ ] repositório privado (o README lista as fragilidades do sistema)
 - [ ] habilitação regulatória: operar on-ramp fiat e redistribuir fundos de

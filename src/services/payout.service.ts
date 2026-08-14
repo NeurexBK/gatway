@@ -8,6 +8,7 @@ import {
   distribute,
   vaultHeadroomLamports,
 } from './distribution.service';
+import { LOCK_NAMES, withLock } from './lock.service';
 import { getSettings } from './settings.service';
 
 /**
@@ -24,9 +25,6 @@ import { getSettings } from './settings.service';
  */
 
 const log = logger.child({ scope: 'payout' });
-
-/** Uma execução por vez no processo — duas paralelas dividiriam o mesmo saldo. */
-let running = false;
 
 export interface RunOptions {
   /** SCHEDULED = timer in-process · CRON = cron externo · MANUAL = admin. */
@@ -76,10 +74,16 @@ async function persistAllocations(
  * deixar o motivo registrado para inspeção.
  */
 export async function runProfitDistribution(options: RunOptions = {}): Promise<RunSummary> {
-  const { trigger = 'SCHEDULED', scheduledFor = new Date(), ignoreMinimum = false } = options;
+  // Lock no banco, não booleano em memória: duas instâncias disparando ao mesmo
+  // tempo (cron + botão manual, ou dois containers) dividiriam o mesmo saldo.
+  const outcome = await withLock(
+    LOCK_NAMES.PAYOUT,
+    () => runProfitDistributionLocked(options),
+    { ttlMs: 300_000, meta: `trigger=${options.trigger ?? 'SCHEDULED'}` },
+  );
 
-  if (running) {
-    log.warn('distribuição já em execução — ignorando disparo concorrente');
+  if (!outcome.acquired) {
+    log.warn('distribuição já em execução em outra instância — ignorando disparo');
     return {
       runId: null,
       status: PayoutRunStatus.SKIPPED,
@@ -89,9 +93,13 @@ export async function runProfitDistribution(options: RunOptions = {}): Promise<R
       skipReason: 'execução concorrente em andamento',
     };
   }
-  running = true;
+  return outcome.result;
+}
 
-  try {
+async function runProfitDistributionLocked(options: RunOptions): Promise<RunSummary> {
+  const { trigger = 'SCHEDULED', scheduledFor = new Date(), ignoreMinimum = false } = options;
+
+  {
     const settings = await getSettings();
 
     // 1) Pool elegível: ordens liquidadas cujo lucro ainda não saiu.
@@ -181,12 +189,9 @@ export async function runProfitDistribution(options: RunOptions = {}): Promise<R
     );
 
     return await executeRun(run, allocations);
-  } catch (err) {
-    log.error({ err }, 'distribuição de lucro falhou');
-    throw err;
-  } finally {
-    running = false;
   }
+  // O lock é liberado pelo `withLock` em runProfitDistribution, inclusive
+  // quando isto lança.
 }
 
 /** Envia os lotes de uma execução e fecha o estado (também usado na retomada). */

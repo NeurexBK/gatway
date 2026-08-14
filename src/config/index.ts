@@ -128,6 +128,8 @@ const envSchema = z.object({
   MAX_TRANSFERS_PER_TX: numeric(18, { min: 1, max: 24 }),
   MAX_ATTEMPTS: numeric(3, { min: 1, max: 10 }),
   DEPOSIT_WAIT_TIMEOUT_MS: numeric(180_000, { min: 0 }),
+  /** Teto de trabalho síncrono por invocação serverless (< maxDuration). */
+  SERVERLESS_BUDGET_MS: numeric(45_000, { min: 1_000 }),
   /** Teto por ordem — limita o dano de um evento forjado ou de um bug. */
   MAX_ORDER_INPUT_RAW: numeric(50_000_000_000, { min: 1 }),
 
@@ -218,11 +220,26 @@ export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 export const LAMPORTS_PER_SOL = 1_000_000_000;
 export const TOTAL_BPS = BPS_TOTAL;
 
-/** Override explícito vence a detecção; sem override, serverless => desligada. */
+/**
+ * A pipeline é liberada em qualquer runtime — inclusive serverless — desde que
+ * os locks sejam distribuídos, o que passou a ser o caso: `lock.service.ts` usa
+ * a tabela `Lock` no banco, não estruturas em memória. `ALLOW_PIPELINE=false`
+ * segue disponível como kill switch operacional.
+ */
 const allowPipeline =
   env.ALLOW_PIPELINE === undefined || env.ALLOW_PIPELINE === ''
-    ? !isServerless
+    ? true
     : /^(1|true|yes|on)$/i.test(env.ALLOW_PIPELINE);
+
+/**
+ * Orçamento de tempo para trabalho síncrono numa invocação serverless.
+ *
+ * Em serverless não existe "background": depois de responder, a função pode ser
+ * congelada ou morta, então `setImmediate` não é garantia de nada. A pipeline
+ * roda ANTES da resposta, com este teto para não estourar o `maxDuration` da
+ * plataforma (60s no vercel.json) e virar timeout.
+ */
+const serverlessBudgetMs = env.SERVERLESS_BUDGET_MS;
 
 export const config = {
   env: env.NODE_ENV,
@@ -275,8 +292,16 @@ export const config = {
     maxAttempts: env.MAX_ATTEMPTS,
     depositWaitTimeoutMs: env.DEPOSIT_WAIT_TIMEOUT_MS,
     maxOrderInputRaw: BigInt(env.MAX_ORDER_INPUT_RAW),
-    /** Quando false, nenhuma etapa que move dinheiro executa. */
+    /** Kill switch: quando false, nenhuma etapa que move dinheiro executa. */
     allowPipeline,
+    serverlessBudgetMs,
+    /**
+     * Espera pelo depósito. Em serverless é limitada pelo orçamento da
+     * invocação — o resto fica para o próximo tick do cron.
+     */
+    depositWaitBudgetMs: isServerless
+      ? Math.min(env.DEPOSIT_WAIT_TIMEOUT_MS, Math.floor(serverlessBudgetMs * 0.5))
+      : env.DEPOSIT_WAIT_TIMEOUT_MS,
   },
 
   feeProviders: {

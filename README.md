@@ -95,11 +95,16 @@ existe é o equivalente prático:
 
 ## Deploy
 
-Ver **[DEPLOY.md](DEPLOY.md)**. Resumo: **use um host com processo persistente**
-(Render, Railway, Fly.io, VPS). Em serverless (Vercel) a API sobe e o painel
-funciona, mas a pipeline que move dinheiro fica **desligada** de propósito — os
-locks de concorrência e o agendador dependem de um processo único de longa
-duração. `render.yaml` e `Dockerfile` estão prontos no repo.
+Ver **[DEPLOY.md](DEPLOY.md)**. A pipeline completa funciona tanto em serverless
+(Vercel) quanto em host persistente (Render, Railway, Fly.io, VPS) — a exclusão
+mútua vem de lock no banco, não de estruturas em memória. `vercel.json`,
+`render.yaml` e `Dockerfile` estão prontos no repo.
+
+Duas diferenças em serverless, detalhadas no DEPLOY.md: o webhook processa antes
+de responder (não existe background lá), e o trabalho periódico depende de um
+cron externo chamando `/admin/cron/tick` — com cron diário, uma ordem cujo
+depósito aterra tarde pode esperar até 24h. Um host persistente não tem nenhuma
+das duas restrições.
 
 ## Setup local
 
