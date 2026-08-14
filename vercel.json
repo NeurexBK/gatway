@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "node scripts/set-db-provider.js postgresql && prisma generate && tsc -p tsconfig.json",
+  "buildCommand": "npm run vercel-build",
   "installCommand": "npm install",
   "functions": {
     "api/index.ts": {
